@@ -9,6 +9,7 @@ import (
 	"regexp"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/schollz/progressbar/v3"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -20,6 +21,22 @@ import (
 	"k8s.io/client-go/tools/clientcmd"
 	// "k8s.io/kubectl/pkg/drain"
 )
+
+// Color Constants and settings
+const dark = 30
+const light = 37
+const red = 31
+const green = 32
+const yellow = 33
+
+var goodColor = colorString(green, false)
+
+// var brightGreen = colorString(green, true)
+var errorColor = colorString(red, false)
+var warningColor = colorString(yellow, false)
+var normalColor = colorString(light, false)
+var white = colorString(light, true)
+var darkGray = trueColorString(96, 96, 96)
 
 func homeDir() string {
 	if h := os.Getenv("HOME"); h != "" {
@@ -86,7 +103,7 @@ func breakoutImage(image string) (string, string, string) {
 	return matches[0], matches[1], matches[2]
 }
 
-func findCiliumVersion(clientset *kubernetes.Clientset) string {
+func findCiliumVersion(clientset *kubernetes.Clientset, display bool) string {
 	//	var warningColor = colorString(33, false)
 	var requiredCiliumVersion string
 
@@ -103,10 +120,17 @@ func findCiliumVersion(clientset *kubernetes.Clientset) string {
 			}
 		}
 	}
+
+	if display {
+		if requiredCiliumVersion != "" {
+			fmt.Printf("%s           Cilium Version: %s%s%s\n", goodColor, white, requiredCiliumVersion, normalColor)
+		}
+	}
+
 	return requiredCiliumVersion
 }
 
-func findNginxVersion(clientset *kubernetes.Clientset) string {
+func findNginxVersion(clientset *kubernetes.Clientset, display bool) string {
 	//	var warningColor = colorString(33, false)
 	var requiredNginxVersion string
 
@@ -123,10 +147,17 @@ func findNginxVersion(clientset *kubernetes.Clientset) string {
 			}
 		}
 	}
+
+	if display {
+		if requiredNginxVersion != "" {
+			fmt.Printf("%s            Nginx Version: %s%s%s\n", goodColor, white, requiredNginxVersion, normalColor)
+		}
+	}
+
 	return requiredNginxVersion
 }
 
-func findIstioVersion(clientset *kubernetes.Clientset) string {
+func findIstioVersion(clientset *kubernetes.Clientset, display bool) string {
 	var warningColor = colorString(33, false)
 	var requiredIstioVersion string
 
@@ -136,6 +167,12 @@ func findIstioVersion(clientset *kubernetes.Clientset) string {
 		requiredIstioVersion = ""
 	} else {
 		_, _, requiredIstioVersion = breakoutImage(istioPodList.Items[0].Spec.Containers[0].Image)
+	}
+
+	if display {
+		if requiredIstioVersion != "" {
+			fmt.Printf("%s            Istio Version: %s%s%s\n", goodColor, white, requiredIstioVersion, normalColor)
+		}
 	}
 
 	return requiredIstioVersion
@@ -225,6 +262,14 @@ func majorMinor(symver string) string {
 	return fmt.Sprintf("%s.%s", versionSpilt[0], versionSpilt[1])
 }
 
+func repeatChar(char string, count int) string {
+	out := ""
+	for i := 0; i < count; i++ {
+		out = fmt.Sprintf("%s%s", out, char)
+	}
+	return out
+}
+
 type nodeVersionInfo struct {
 	name     string
 	version  string
@@ -242,25 +287,9 @@ func main() {
 	var nukeHelmSecrets bool
 	var debug bool
 
-	// Color Constants and settings
-	const dark = 30
-	const light = 37
-	const red = 31
-	const green = 32
-	const yellow = 33
-
-	var goodColor = colorString(green, false)
-	//	var brightGreen = colorString(green, true)
-	var errorColor = colorString(red, false)
-	var warningColor = colorString(yellow, false)
-	var normalColor = colorString(light, false)
-	var white = colorString(light, true)
-	var darkGray = trueColorString(96, 96, 96)
-
+	var divider string
 	var serverName string
 	var requiredIstioVersion string
-	var ciliumVersion string
-	var nginxVersion string
 	var podsToRestart podsToRestartList
 	var restarts ownerInfoList
 	var upToDateNote string
@@ -317,8 +346,9 @@ func main() {
 		serverName = fmt.Sprintf("%s", kubeContext)
 	}
 
-	fmt.Printf("%sPulling data from %s...\n", normalColor, serverName)
-	fmt.Printf("%s===================================================\n", darkGray)
+	divider = fmt.Sprintf("%s%s%s\n", darkGray, repeatChar("=", 22+utf8.RuneCountInString(serverName)), normalColor)
+
+	fmt.Printf("%sPulling data from %s...\n%s", normalColor, serverName, divider)
 
 	serverVersionInfo, err := disClient.ServerVersion()
 	if err != nil {
@@ -342,24 +372,13 @@ func main() {
 	}
 	fmt.Printf("%s  Kubernetes Node Version: %s%s.x%s%s\n", goodColor, white, majorMinor(nodeVersions[0].version), upToDateNote, normalColor)
 
-	ciliumVersion = findCiliumVersion(clientset)
-	if ciliumVersion != "" {
-		fmt.Printf("%s           Cilium Version: %s%s%s\n", goodColor, white, ciliumVersion, normalColor)
-	}
+	findCiliumVersion(clientset, true)
+	findNginxVersion(clientset, true)
+	requiredIstioVersion = findIstioVersion(clientset, true)
 
-	nginxVersion = findNginxVersion(clientset)
-	if nginxVersion != "" {
-		fmt.Printf("%s            Nginx Version: %s%s%s\n", goodColor, white, nginxVersion, normalColor)
-	}
-
-	requiredIstioVersion = findIstioVersion(clientset)
-	fmt.Printf("%s            Istio Version: %s%s%s\n", goodColor, white, requiredIstioVersion, normalColor)
-
-	//	fmt.Printf("%s===================================================\n", darkGray)
 	if !versionListOnly {
-		fmt.Printf("\n%sNodes to drain for version Synchronization:\n", normalColor)
+		fmt.Printf("\n%sNodes to drain for version Synchronization:\n%s", normalColor, divider)
 		if !isUpToDate {
-			fmt.Printf("%s===================================================%s\n", darkGray, normalColor)
 			server_majmin := majorMinor(serverVersion)
 
 			for i := 0; i < len(nodeVersions); i++ {
@@ -382,7 +401,6 @@ func main() {
 				}
 			}
 		} else {
-			fmt.Printf("%s===================================================\n", darkGray)
 			fmt.Printf("%sAll nodes running correct version of Kubernetes %s\n", goodColor, normalColor)
 		}
 
@@ -390,8 +408,7 @@ func main() {
 			var secretIssueFound bool
 			var helmSecretCount int
 			secretIssueFound = false
-			fmt.Printf("\nPulling Helm Secrets for validation...\n")
-			fmt.Printf("%s===================================================\n", darkGray)
+			fmt.Printf("\nPulling Helm Secrets for validation...\n%s", divider)
 			secretList, _ := clientset.CoreV1().Secrets(namespace).List(context.TODO(), metav1.ListOptions{})
 			for _, s := range secretList.Items {
 				if strings.Contains(s.Name, "sh.helm.release") {
@@ -419,8 +436,7 @@ func main() {
 
 		if nukeHelmSecrets {
 			var helmSecrets = 0
-			fmt.Printf("\nPulling Helm Secrets for deletion...\n")
-			fmt.Printf("%s===================================================\n", darkGray)
+			fmt.Printf("\nPulling Helm Secrets for deletion...\n%s", divider)
 			secretList, _ := clientset.CoreV1().Secrets(namespace).List(context.TODO(), metav1.ListOptions{})
 			for _, s := range secretList.Items {
 				if strings.Contains(s.Name, "sh.helm.release") {
@@ -446,8 +462,7 @@ func main() {
 			}
 		}
 
-		fmt.Printf("\n%sPods needing restart for Istio Synchronization: \n", normalColor)
-		fmt.Printf("%s===================================================\n", darkGray)
+		fmt.Printf("\n%sPods needing restart for Istio Synchronization: \n%s", normalColor, divider)
 
 		podList, _ := clientset.CoreV1().Pods("").List(context.TODO(), metav1.ListOptions{})
 		if len(podList.Items) == 0 {
@@ -494,14 +509,12 @@ func main() {
 
 		//sort.Sort(podsToRestart)
 		if len(restarts) > 0 && !fixIt { // Only show info
-			fmt.Printf("\n%sOwners to restart for Istio Synchronization: %d\n", normalColor, len(restarts))
-			fmt.Printf("%s===================================================%s\n", darkGray, normalColor)
+			fmt.Printf("\n%sOwners to restart for Istio Synchronization: %d\n%s", normalColor, len(restarts), divider)
 			for i := 0; i < len(restarts); i++ {
 				fmt.Printf("%sWould restart: %s %s %s/%s %s\n", normalColor, white, restarts[i].kind, restarts[i].namespace, restarts[i].name, normalColor)
 			}
 		} else if len(restarts) > 0 && fixIt { // Show and Act
-			fmt.Printf("\n%sOwners to restart for Istio Synchronization: %d\n", normalColor, len(restarts))
-			fmt.Printf("%s===================================================%s\n", darkGray, normalColor)
+			fmt.Printf("\n%sOwners to restart for Istio Synchronization: %d\n%s", normalColor, len(restarts), divider)
 			for i := 0; i < len(restarts); i++ {
 
 				fmt.Printf("%sRestarting: %s %s %s/%s %s\n", normalColor, white, restarts[i].kind, restarts[i].namespace, restarts[i].name, normalColor)
