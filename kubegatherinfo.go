@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"flag"
 	"fmt"
 	"os"
@@ -111,23 +112,26 @@ func findCiliumVersion(clientset *kubernetes.Clientset, display bool) string {
 	if len(kubeSystemPodList.Items) == 0 {
 		requiredCiliumVersion = ""
 	} else {
+		// loop pods until we find the cilium-operator whatever pod, and then look up the owner and return it's image.
 		for p := 0; p < len(kubeSystemPodList.Items); p++ {
 			name := kubeSystemPodList.Items[p].OwnerReferences[0].Name
 			if len(name) > 16 {
 				if name[:15] == "cilium-operator" {
 					_, _, requiredCiliumVersion = breakoutImage(findOwnerImage(clientset, "kube-system", kubeSystemPodList.Items[p].OwnerReferences[0].Name, kubeSystemPodList.Items[p].OwnerReferences[0].Kind))
+
+					if display {
+						if requiredCiliumVersion != "" {
+							fmt.Printf("%s           Cilium Version: %s%s%s\n", goodColor, white, requiredCiliumVersion, normalColor)
+						}
+					}
+
+					return requiredCiliumVersion
 				}
 			}
 		}
 	}
 
-	if display {
-		if requiredCiliumVersion != "" {
-			fmt.Printf("%s           Cilium Version: %s%s%s\n", goodColor, white, requiredCiliumVersion, normalColor)
-		}
-	}
-
-	return requiredCiliumVersion
+	return ""
 }
 
 func findNginxVersion(clientset *kubernetes.Clientset, display bool) string {
@@ -138,23 +142,26 @@ func findNginxVersion(clientset *kubernetes.Clientset, display bool) string {
 	if len(nginxPodList.Items) == 0 {
 		requiredNginxVersion = ""
 	} else {
+		// loop pods until we find the nginx-ingres-controller whatever pod, and then look up the owner and return it's image.
 		for p := 0; p < len(nginxPodList.Items); p++ {
 			name := nginxPodList.Items[p].OwnerReferences[0].Name
 			if len(name) > 16 {
 				if name[:15] == "nginx-ingress-c" {
 					_, _, requiredNginxVersion = breakoutImage(findOwnerImage(clientset, "nginx-ingress", nginxPodList.Items[p].OwnerReferences[0].Name, nginxPodList.Items[p].OwnerReferences[0].Kind))
+
+					if display {
+						if requiredNginxVersion != "" {
+							fmt.Printf("%s            Nginx Version: %s%s%s\n", goodColor, white, requiredNginxVersion, normalColor)
+						}
+					}
+
+					return requiredNginxVersion
 				}
 			}
 		}
 	}
 
-	if display {
-		if requiredNginxVersion != "" {
-			fmt.Printf("%s            Nginx Version: %s%s%s\n", goodColor, white, requiredNginxVersion, normalColor)
-		}
-	}
-
-	return requiredNginxVersion
+	return ""
 }
 
 func findIstioVersion(clientset *kubernetes.Clientset, display bool) string {
@@ -275,6 +282,24 @@ type nodeVersionInfo struct {
 	version  string
 	upToDate bool
 }
+type patchStringValue struct {
+	Op    string `json:"op"`
+	Path  string `json:"path"`
+	Value bool   `json:"value"`
+}
+
+func cordonNode(clientset *kubernetes.Clientset, nodeName string) {
+	payload := []patchStringValue{{
+		Op:    "replace",
+		Path:  "/spec/unschedulable",
+		Value: true,
+	}}
+	payloadBytes, _ := json.Marshal(payload)
+	_, err := clientset.CoreV1().Nodes().Patch(context.TODO(), nodeName, k8stypes.StrategicMergePatchType, payloadBytes, v1.PatchOptions{})
+	if err != nil {
+		panic(err)
+	}
+}
 
 func main() {
 	// Parameters
@@ -392,8 +417,7 @@ func main() {
 							fmt.Printf("Eviction not supported on current cluster\n")
 						} else {
 							// Let's drain some nodes!
-							fmt.Printf("Would Drain %s\n", nodeVersions[i].name)
-							//							drain.RunCordonOrUncordon()
+							cordonNode(clientset, nodeVersions[i].name)
 						}
 					} else {
 						fmt.Printf("Would Drain %s\n", nodeVersions[i].name)
@@ -413,7 +437,9 @@ func main() {
 			for _, s := range secretList.Items {
 				if strings.Contains(s.Name, "sh.helm.release") {
 					helmSecretCount++
-					if s.GetObjectMeta().GetLabels()["status"] == "pending-upgrade" {
+					if (s.GetObjectMeta().GetLabels()["status"] == "pending-upgrade") || 
+                       (s.GetObjectMeta().GetLabels()["status"] == "pending-install") ||
+                       (s.GetObjectMeta().GetLabels()["status"] == "pending-rollback") {
 						fmt.Printf("%s: %s -> %s", s.Namespace, s.Name, s.GetObjectMeta().GetLabels()["status"])
 						secretIssueFound = true
 						if fixIt {
