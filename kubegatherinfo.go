@@ -88,6 +88,15 @@ type ownerInfo struct {
 	kind      string
 }
 
+type clusterInfo struct {
+	serverVersion    string
+	nodeVersion      string
+	nodeUpToDateNote string
+	ciliumVersion    string
+	istioVersion     string
+	nginxVersion     string
+}
+
 type ownerInfoList []ownerInfo
 
 type podsToRestartList []podInfo
@@ -303,7 +312,7 @@ func cordonNode(clientset *kubernetes.Clientset, nodeName string) {
 
 func main() {
 	// Parameters
-	var kubeConfig *string
+	//var kubeConfig *string
 	var kubeContext string
 	var namespace string
 	var fixIt bool
@@ -311,7 +320,62 @@ func main() {
 	var validateHelmSecrets bool
 	var nukeHelmSecrets bool
 	var debug bool
+	var summary bool
+	var baseConfigDir string
+	var clusterVersions []clusterInfo
+	var clusterList []string
+	var clusterNameWidth int
+	clusterList = append(clusterList, "rnuse1-dmzsql-background-tsm-a")
+	clusterList = append(clusterList, "rnuse1-dmzsql-background-tsm-b")
+	clusterList = append(clusterList, "rnusw2-dmzsql-background-tsm-a")
+	clusterList = append(clusterList, "rnusw2-dmzsql-background-tsm-b")
 
+	home := homeDir()
+
+	flag.BoolVar(&debug, "d", false, "(optional) Debug")
+	flag.BoolVar(&summary, "S", false, "(optional) Summary Table View")
+	flag.BoolVar(&fixIt, "f", false, "(optional) Fix issues found")
+	flag.BoolVar(&versionListOnly, "v", false, "(optional) Basic Version List Only")
+	flag.StringVar(&baseConfigDir, "b", ".kube", "(Optional) Base dir for kubernetes configs")
+	flag.BoolVar(&validateHelmSecrets, "s", false, "(optional) Validate Helm Secrets (can add considerable time)")
+	flag.StringVar(&namespace, "n", "", "(optional) Namespace for affected checks/fixes")
+	flag.BoolVar(&nukeHelmSecrets, "N", false, "(optional) Nuke ALL Helm Secrets")
+	flag.StringVar(&kubeContext, "c", "", "(optional) Kubernetes Context to use")
+	flag.Parse()
+
+	/*if home != "" {
+		kubeConfig = flag.String("kubeconfig", filepath.Join(home, baseConfigDir, "config"), "(optional) absolute path to the kubeconfig file")
+	} else {
+		kubeConfig = flag.String("kubeconfig", "", "absolute path to the kubeconfig file")
+	}*/
+
+	clusterNameWidth = 1
+	for i := 0; i < len(clusterList); i++ {
+		if len(clusterList[i]) > clusterNameWidth {
+			clusterNameWidth = len(clusterList[i])
+		}
+	}
+
+	fmt.Printf("%*s | %10s | %24s | %8s | %8s | %10s \n", clusterNameWidth, " ", "Server", "Node", "Istio", "Nginx", "Cilium")
+
+	for i := 0; i < len(clusterList); i++ {
+		clusterKubeConfig := filepath.Join(home, baseConfigDir, clusterList[i])
+
+		currentInfo := doTheThing(clusterKubeConfig, kubeContext, namespace, validateHelmSecrets, versionListOnly, summary, fixIt, nukeHelmSecrets, debug)
+		clusterVersions = append(clusterVersions, currentInfo)
+
+		// fmt.Printf("%sKubernetes Server Version: %s%s%s\n", goodColor, white, currentInfo.serverVersion, normalColor)
+		// fmt.Printf("%s  Kubernetes Node Version: %s%s.x%s%s\n", goodColor, white, currentInfo.nodeVersion, clusterVersions[i].nodeUpToDateNote, normalColor)
+		// fmt.Printf("%s            Istio Version: %s%s%s\n", goodColor, white, currentInfo.istioVersion, normalColor)
+		// fmt.Printf("%s            Nginx Version: %s%s%s\n", goodColor, white, currentInfo.nginxVersion, normalColor)
+		// fmt.Printf("%s           Cilium Version: %s%s%s\n", goodColor, white, currentInfo.ciliumVersion, normalColor)
+
+		fmt.Printf("%*s | %10s | %24s | %8s | %8s | %10s \n", clusterNameWidth, clusterList[i], currentInfo.serverVersion, currentInfo.nodeVersion, currentInfo.istioVersion, currentInfo.nginxVersion, currentInfo.ciliumVersion)
+
+	}
+}
+
+func doTheThing(kubeConfig string, kubeContext string, namespace string, validateHelmSecrets bool, versionListOnly bool, summary bool, fixIt bool, nukeHelmSecrets bool, debug bool) clusterInfo {
 	var divider string
 	var serverName string
 	var requiredIstioVersion string
@@ -319,23 +383,7 @@ func main() {
 	var restarts ownerInfoList
 	var upToDateNote string
 	var nodesOutOfDate int
-
-	home := homeDir()
-
-	if home != "" {
-		kubeConfig = flag.String("kubeconfig", filepath.Join(home, ".kube", "config"), "(optional) absolute path to the kubeconfig file")
-	} else {
-		kubeConfig = flag.String("kubeconfig", "", "absolute path to the kubeconfig file")
-	}
-
-	flag.BoolVar(&debug, "d", false, "(optional) Debug")
-	flag.BoolVar(&fixIt, "f", false, "(optional) Fix issues found")
-	flag.BoolVar(&versionListOnly, "v", false, "(optional) Basic Version List Only")
-	flag.BoolVar(&validateHelmSecrets, "s", false, "(optional) Validate Helm Secrets (can add considerable time)")
-	flag.StringVar(&namespace, "n", "", "(optional) Namespace for affected checks/fixes")
-	flag.BoolVar(&nukeHelmSecrets, "N", false, "(optional) Nuke ALL Helm Secrets")
-	flag.StringVar(&kubeContext, "c", "", "(optional) Kubernetes Context to use")
-	flag.Parse()
+	var clusterData clusterInfo
 
 	configOverrides := &clientcmd.ConfigOverrides{}
 
@@ -343,7 +391,7 @@ func main() {
 		configOverrides = &clientcmd.ConfigOverrides{CurrentContext: kubeContext}
 	}
 
-	configLoadingRules := &clientcmd.ClientConfigLoadingRules{ExplicitPath: *kubeConfig}
+	configLoadingRules := &clientcmd.ClientConfigLoadingRules{ExplicitPath: kubeConfig}
 
 	config, err := clientcmd.NewNonInteractiveDeferredLoadingClientConfig(configLoadingRules, configOverrides).ClientConfig()
 	if err != nil {
@@ -361,19 +409,27 @@ func main() {
 		panic(err.Error())
 	}
 
-	if *kubeConfig != "" {
+	if kubeConfig != "" {
 		if kubeContext != "" {
-			serverName = fmt.Sprintf("%s/%s", *kubeConfig, kubeContext)
+			serverName = fmt.Sprintf("%s/%s", kubeConfig, kubeContext)
 		} else {
-			serverName = fmt.Sprintf("%s", *kubeConfig)
+			serverName = fmt.Sprintf("%s", kubeConfig)
 		}
 	} else {
 		serverName = fmt.Sprintf("%s", kubeContext)
 	}
+	nameParts := strings.Split(serverName, `/`)
+	serverName = nameParts[len(nameParts)-1]
+
+	if summary {
+		fmt.Printf("Context: %s", serverName)
+	}
 
 	divider = fmt.Sprintf("%s%s%s\n", darkGray, repeatChar("=", 22+utf8.RuneCountInString(serverName)), normalColor)
 
-	fmt.Printf("%sPulling data from %s...\n%s", normalColor, serverName, divider)
+	if debug {
+		fmt.Printf("%sPulling data from %s...\n%s", normalColor, serverName, divider)
+	}
 
 	serverVersionInfo, err := disClient.ServerVersion()
 	if err != nil {
@@ -381,7 +437,11 @@ func main() {
 	}
 	serverVersion := strings.Split(serverVersionInfo.String(), "-")[0]
 
-	fmt.Printf("%sKubernetes Server Version: %s%s%s\n", goodColor, white, serverVersion, normalColor)
+	if debug {
+		fmt.Printf("%sKubernetes Server Version: %s%s%s\n", goodColor, white, serverVersion, normalColor)
+	}
+
+	clusterData.serverVersion = serverVersion
 
 	nodeVersions, isUpToDate := validateNodes(clientset, fmt.Sprintf("%s", serverVersion))
 	if !isUpToDate {
@@ -395,11 +455,21 @@ func main() {
 		}
 		upToDateNote = fmt.Sprintf("%s* %d of %d wrong %s", errorColor, nodesOutOfDate, len(nodeVersions), normalColor)
 	}
-	fmt.Printf("%s  Kubernetes Node Version: %s%s.x%s%s\n", goodColor, white, majorMinor(nodeVersions[0].version), upToDateNote, normalColor)
+	if debug {
+		fmt.Printf("%s  Kubernetes Node Version: %s%s.x%s%s\n", goodColor, white, majorMinor(nodeVersions[0].version), upToDateNote, normalColor)
+	}
 
-	findCiliumVersion(clientset, true)
-	findNginxVersion(clientset, true)
-	requiredIstioVersion = findIstioVersion(clientset, true)
+	clusterData.nodeVersion = nodeVersions[0].version
+
+	clusterData.nodeUpToDateNote = "Yes"
+	if nodesOutOfDate > 0 {
+		clusterData.nodeUpToDateNote = "No!"
+	}
+
+	clusterData.ciliumVersion = findCiliumVersion(clientset, debug)
+	clusterData.nginxVersion = findNginxVersion(clientset, debug)
+	requiredIstioVersion = findIstioVersion(clientset, debug)
+	clusterData.istioVersion = requiredIstioVersion
 
 	if !versionListOnly {
 		fmt.Printf("\n%sNodes to drain for version Synchronization:\n%s", normalColor, divider)
@@ -437,9 +507,9 @@ func main() {
 			for _, s := range secretList.Items {
 				if strings.Contains(s.Name, "sh.helm.release") {
 					helmSecretCount++
-					if (s.GetObjectMeta().GetLabels()["status"] == "pending-upgrade") || 
-                       (s.GetObjectMeta().GetLabels()["status"] == "pending-install") ||
-                       (s.GetObjectMeta().GetLabels()["status"] == "pending-rollback") {
+					if (s.GetObjectMeta().GetLabels()["status"] == "pending-upgrade") ||
+						(s.GetObjectMeta().GetLabels()["status"] == "pending-install") ||
+						(s.GetObjectMeta().GetLabels()["status"] == "pending-rollback") {
 						fmt.Printf("%s: %s -> %s", s.Namespace, s.Name, s.GetObjectMeta().GetLabels()["status"])
 						secretIssueFound = true
 						if fixIt {
@@ -577,6 +647,8 @@ func main() {
 		}
 	}
 	fmt.Printf("%s", normalColor)
+
+	return clusterData
 }
 
 func (o ownerInfoList) containsName(n string) bool {
