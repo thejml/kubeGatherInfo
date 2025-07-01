@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"strings"
+	"sync"
 	"time"
 	"unicode/utf8"
 
@@ -95,6 +96,7 @@ type clusterInfo struct {
 	ciliumVersion    string
 	istioVersion     string
 	nginxVersion     string
+	varnishBuildID   string
 }
 
 type ownerInfoList []ownerInfo
@@ -119,7 +121,7 @@ func findCiliumVersion(clientset *kubernetes.Clientset, display bool) string {
 
 	kubeSystemPodList, _ := clientset.CoreV1().Pods("kube-system").List(context.TODO(), metav1.ListOptions{})
 	if len(kubeSystemPodList.Items) == 0 {
-		requiredCiliumVersion = ""
+		requiredCiliumVersion = "N/A"
 	} else {
 		// loop pods until we find the cilium-operator whatever pod, and then look up the owner and return it's image.
 		for p := 0; p < len(kubeSystemPodList.Items); p++ {
@@ -192,6 +194,27 @@ func findIstioVersion(clientset *kubernetes.Clientset, display bool) string {
 	}
 
 	return requiredIstioVersion
+}
+
+func findVarnishBuildID(clientset *kubernetes.Clientset, display bool) string {
+	//var warningColor = colorString(33, false)
+	var requiredVarnishVersion string
+
+	istioPodList, _ := clientset.CoreV1().Pods("").List(context.TODO(), metav1.ListOptions{LabelSelector: "app.kubernetes.io/name=varnish-enterprise"})
+	if len(istioPodList.Items) == 0 {
+		//fmt.Printf("%Varnish Enterprise not running in this cluster!\n", warningColor)
+		requiredVarnishVersion = "N/A"
+	} else { // XXX Need to check ALL pods here
+		_, _, requiredVarnishVersion = breakoutImage(istioPodList.Items[0].Spec.Containers[0].Image)
+	}
+
+	if display {
+		if requiredVarnishVersion != "" {
+			fmt.Printf("%s            Varnish BuildID: %s%s%s\n", goodColor, white, requiredVarnishVersion, normalColor)
+		}
+	}
+
+	return requiredVarnishVersion
 }
 
 func validateNodes(clientset *kubernetes.Clientset, desiredVersion string) ([]nodeVersionInfo, bool) {
@@ -310,9 +333,34 @@ func cordonNode(clientset *kubernetes.Clientset, nodeName string) {
 	}
 }
 
+func getKubeConfigFiles(dir string) []string {
+	var files []string
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return files
+	}
+
+	for _, e := range entries {
+		file, err := os.Open(filepath.Join(dir, e.Name()))
+		if err != nil {
+			fmt.Printf("Error reading file stats for %s", e.Name())
+			return files
+		}
+		fileInfo, err := file.Stat()
+		if !fileInfo.IsDir() {
+			if e.Name() != "config" {
+				files = append(files, fmt.Sprintf("%s", e.Name()))
+			}
+		}
+	}
+	return files
+}
+
 func main() {
 	// Parameters
 	//var kubeConfig *string
+	var wg sync.WaitGroup
+	//const maxWorkerThreads = 10
 	var kubeContext string
 	var namespace string
 	var fixIt bool
@@ -322,14 +370,14 @@ func main() {
 	var debug bool
 	var summary bool
 	var baseConfigDir string
-	var clusterVersions []clusterInfo
+	//var clusterVersions []clusterInfo
 	var clusterList []string
 	var clusterNameWidth int
-	clusterList = append(clusterList, "rnuse1-dmzsql-background-tsm-a")
+	/*clusterList = append(clusterList, "rnuse1-dmzsql-background-tsm-a")
 	clusterList = append(clusterList, "rnuse1-dmzsql-background-tsm-b")
 	clusterList = append(clusterList, "rnusw2-dmzsql-background-tsm-a")
 	clusterList = append(clusterList, "rnusw2-dmzsql-background-tsm-b")
-
+	*/
 	home := homeDir()
 
 	flag.BoolVar(&debug, "d", false, "(optional) Debug")
@@ -342,6 +390,8 @@ func main() {
 	flag.BoolVar(&nukeHelmSecrets, "N", false, "(optional) Nuke ALL Helm Secrets")
 	flag.StringVar(&kubeContext, "c", "", "(optional) Kubernetes Context to use")
 	flag.Parse()
+
+	clusterList = getKubeConfigFiles(filepath.Join(home, baseConfigDir))
 
 	/*if home != "" {
 		kubeConfig = flag.String("kubeconfig", filepath.Join(home, baseConfigDir, "config"), "(optional) absolute path to the kubeconfig file")
@@ -356,13 +406,13 @@ func main() {
 		}
 	}
 
-	fmt.Printf("%*s | %10s | %24s | %8s | %8s | %10s \n", clusterNameWidth, " ", "Server", "Node", "Istio", "Nginx", "Cilium")
+	fmt.Printf("%*s | %10s | %24s | %8s | %8s | %10s | %10s\n", clusterNameWidth, " ", "Server", "Node", "Istio", "Nginx", "Cilium", "Varnish")
 
 	for i := 0; i < len(clusterList); i++ {
-		clusterKubeConfig := filepath.Join(home, baseConfigDir, clusterList[i])
 
-		currentInfo := doTheThing(clusterKubeConfig, kubeContext, namespace, validateHelmSecrets, versionListOnly, summary, fixIt, nukeHelmSecrets, debug)
-		clusterVersions = append(clusterVersions, currentInfo)
+		wg.Add(1)
+		go doTheThing(&wg, clusterList[i], filepath.Join(home, baseConfigDir, clusterList[i]), kubeContext, namespace, validateHelmSecrets, versionListOnly, summary, fixIt, nukeHelmSecrets, clusterNameWidth, debug)
+		//clusterVersions = append(clusterVersions, currentInfo)
 
 		// fmt.Printf("%sKubernetes Server Version: %s%s%s\n", goodColor, white, currentInfo.serverVersion, normalColor)
 		// fmt.Printf("%s  Kubernetes Node Version: %s%s.x%s%s\n", goodColor, white, currentInfo.nodeVersion, clusterVersions[i].nodeUpToDateNote, normalColor)
@@ -370,12 +420,17 @@ func main() {
 		// fmt.Printf("%s            Nginx Version: %s%s%s\n", goodColor, white, currentInfo.nginxVersion, normalColor)
 		// fmt.Printf("%s           Cilium Version: %s%s%s\n", goodColor, white, currentInfo.ciliumVersion, normalColor)
 
-		fmt.Printf("%*s | %10s | %24s | %8s | %8s | %10s \n", clusterNameWidth, clusterList[i], currentInfo.serverVersion, currentInfo.nodeVersion, currentInfo.istioVersion, currentInfo.nginxVersion, currentInfo.ciliumVersion)
+		// Done in "doTheThing"
+		//fmt.Printf("%*s | %10s | %24s | %8s | %8s | %10s \n", clusterNameWidth, clusterList[i], currentInfo.serverVersion, currentInfo.nodeVersion, currentInfo.istioVersion, currentInfo.nginxVersion, currentInfo.ciliumVersion)
 
 	}
+
+	wg.Wait()
 }
 
-func doTheThing(kubeConfig string, kubeContext string, namespace string, validateHelmSecrets bool, versionListOnly bool, summary bool, fixIt bool, nukeHelmSecrets bool, debug bool) clusterInfo {
+func doTheThing(wg *sync.WaitGroup, clusterName string, kubeConfig string, kubeContext string, namespace string, validateHelmSecrets bool, versionListOnly bool, summary bool, fixIt bool, nukeHelmSecrets bool, clusterNameWidth int, debug bool) clusterInfo {
+	defer wg.Done()
+
 	var divider string
 	var serverName string
 	var requiredIstioVersion string
@@ -395,18 +450,21 @@ func doTheThing(kubeConfig string, kubeContext string, namespace string, validat
 
 	config, err := clientcmd.NewNonInteractiveDeferredLoadingClientConfig(configLoadingRules, configOverrides).ClientConfig()
 	if err != nil {
-		panic(err.Error())
+		return clusterData
+		//		panic(fmt.Sprintf("%s %s", clusterName, err.Error()))
 	}
 
 	// create the clientset
 	clientset, err := kubernetes.NewForConfig(config)
 	if err != nil {
-		panic(err.Error())
+		return clusterData
+		//		panic(err.Error())
 	}
 
 	disClient, err := discovery.NewDiscoveryClientForConfig(config)
 	if err != nil {
-		panic(err.Error())
+		return clusterData
+		//		panic(err.Error())
 	}
 
 	if kubeConfig != "" {
@@ -468,6 +526,8 @@ func doTheThing(kubeConfig string, kubeContext string, namespace string, validat
 
 	clusterData.ciliumVersion = findCiliumVersion(clientset, debug)
 	clusterData.nginxVersion = findNginxVersion(clientset, debug)
+	clusterData.varnishBuildID = findVarnishBuildID(clientset, debug)
+
 	requiredIstioVersion = findIstioVersion(clientset, debug)
 	clusterData.istioVersion = requiredIstioVersion
 
@@ -647,6 +707,8 @@ func doTheThing(kubeConfig string, kubeContext string, namespace string, validat
 		}
 	}
 	fmt.Printf("%s", normalColor)
+
+	fmt.Printf("%*s | %10s | %24s | %8s | %8s | %10s | %10s \n", clusterNameWidth, clusterName, clusterData.serverVersion, clusterData.nodeVersion, clusterData.istioVersion, clusterData.nginxVersion, clusterData.ciliumVersion, clusterData.varnishBuildID)
 
 	return clusterData
 }
