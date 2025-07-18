@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -16,8 +17,10 @@ import (
 	"github.com/schollz/progressbar/v3"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	v1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	k8stypes "k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/discovery"
+	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/kubernetes"
 	_ "k8s.io/client-go/plugin/pkg/client/auth"
 	"k8s.io/client-go/tools/clientcmd"
@@ -90,18 +93,50 @@ type ownerInfo struct {
 }
 
 type clusterInfo struct {
-	serverVersion    string
-	nodeVersion      string
-	nodeUpToDateNote string
-	ciliumVersion    string
-	istioVersion     string
-	nginxVersion     string
-	varnishBuildID   string
+	clusterName           string
+	clusterRegion         string
+	serverVersion         string
+	nodeVersion           string
+	nodeCount             int
+	nodeUpToDateNote      string
+	ciliumVersion         string
+	istioVersion          string
+	nginxVersion          string
+	varnishBuildID        string
+	varnish               serviceHealthInfo
+	prometheus            serviceHealthInfo
+	thanos                serviceHealthInfo
+	keda                  serviceHealthInfo
+	nodeExplorer          serviceHealthInfo
+	postproxy             serviceHealthInfo
+	karpenter             serviceHealthInfo
+	verticalPodAutoscaler serviceHealthInfo
+	castAgent             serviceHealthInfo
+	costarSyncOperator    serviceHealthInfo
+}
+
+type serviceHealthInfo struct {
+	version            string
+	replicas           int
+	isHealthy          bool
+	isInstalled        bool
+	consistentVersions bool
 }
 
 type ownerInfoList []ownerInfo
 
 type podsToRestartList []podInfo
+
+func nodeVersionClean(ver string) string {
+	r, _ := regexp.Compile("^(v[0-9]+.[0-9]+.[0-9]+)-eks-([0-9a-z]+)$")
+	var matches [2]string
+	for index, match := range r.FindStringSubmatch(ver) {
+		if index > 0 {
+			matches[index-1] = match
+		}
+	}
+	return matches[0]
+}
 
 func breakoutImage(image string) (string, string, string) {
 	r, _ := regexp.Compile("^([0-9a-zA-Z.-]+)/([-0-9a-zA-Z./]+):([-0-9a-zA-Z.]+)$")
@@ -199,13 +234,31 @@ func findIstioVersion(clientset *kubernetes.Clientset, display bool) string {
 func findVarnishBuildID(clientset *kubernetes.Clientset, display bool) string {
 	//var warningColor = colorString(33, false)
 	var requiredVarnishVersion string
+	var allMatching bool
 
-	istioPodList, _ := clientset.CoreV1().Pods("").List(context.TODO(), metav1.ListOptions{LabelSelector: "app.kubernetes.io/name=varnish-enterprise"})
-	if len(istioPodList.Items) == 0 {
+	varnishPodList, _ := clientset.CoreV1().Pods("").List(context.TODO(), metav1.ListOptions{LabelSelector: "app.kubernetes.io/name=varnish-enterprise"})
+	if len(varnishPodList.Items) == 0 {
 		//fmt.Printf("%Varnish Enterprise not running in this cluster!\n", warningColor)
-		requiredVarnishVersion = "N/A"
+		allMatching = true
+		requiredVarnishVersion = "0"
 	} else { // XXX Need to check ALL pods here
-		_, _, requiredVarnishVersion = breakoutImage(istioPodList.Items[0].Spec.Containers[0].Image)
+		_, _, requiredVarnishVersion = breakoutImage(varnishPodList.Items[0].Spec.Containers[0].Image)
+		allMatching = true
+		for i := 0; i < len(varnishPodList.Items)-1; i++ {
+			_, _, varnishVersion := breakoutImage(varnishPodList.Items[i].Spec.Containers[0].Image)
+			if varnishVersion != requiredVarnishVersion {
+				allMatching = false
+				reqVer, _ := strconv.Atoi(requiredVarnishVersion)
+				curVer, _ := strconv.Atoi(varnishVersion)
+				if reqVer > curVer {
+					requiredVarnishVersion = varnishVersion
+				}
+			}
+		}
+	}
+
+	if !allMatching {
+		requiredVarnishVersion = fmt.Sprintf("%s!", requiredVarnishVersion)
 	}
 
 	if display {
@@ -215,6 +268,62 @@ func findVarnishBuildID(clientset *kubernetes.Clientset, display bool) string {
 	}
 
 	return requiredVarnishVersion
+}
+
+func isPhaseHealthy(phase string) bool {
+	return (phase == "Running")
+}
+
+// app.kubernetes.io/component=prometheus
+func isHealthy(clientset *kubernetes.Clientset, labelMatch string, display bool) serviceHealthInfo {
+	//var warningColor = colorString(33, false)
+	var requiredVersion string
+	var health serviceHealthInfo
+	health.isHealthy = true
+	health.isInstalled = true
+
+	podList, _ := clientset.CoreV1().Pods("").List(context.TODO(), metav1.ListOptions{LabelSelector: labelMatch})
+	health.replicas = len(podList.Items)
+
+	if len(podList.Items) == 0 {
+		health.version = "0"
+		health.isHealthy = false
+		health.isInstalled = false
+	} else { // XXX Need to check ALL pods here
+		_, _, health.version = breakoutImage(podList.Items[0].Spec.Containers[0].Image)
+		health.isHealthy = isPhaseHealthy(fmt.Sprintf("%s", podList.Items[0].Status.Phase))
+		health.consistentVersions = true
+		for i := 0; i < len(podList.Items)-1; i++ {
+			_, _, version := breakoutImage(podList.Items[i].Spec.Containers[0].Image)
+			health.isHealthy = isPhaseHealthy(fmt.Sprintf("%s", podList.Items[0].Status.Phase))
+			if version != requiredVersion {
+				health.consistentVersions = false
+				reqVer, _ := strconv.Atoi(requiredVersion)
+				curVer, _ := strconv.Atoi(version)
+				if reqVer > curVer {
+					requiredVersion = version
+				}
+			}
+		}
+	}
+
+	ep, _ := clientset.CoreV1().Endpoints("").List(context.TODO(), metav1.ListOptions{LabelSelector: labelMatch})
+
+	if len(ep.Items) == 0 {
+		health.isHealthy = false
+	}
+
+	if !health.consistentVersions {
+		requiredVersion = fmt.Sprintf("%s!", requiredVersion)
+	}
+
+	if display {
+		if requiredVersion != "" {
+			fmt.Printf("%s            Varnish BuildID: %s%s%s\n", goodColor, white, requiredVersion, normalColor)
+		}
+	}
+
+	return health
 }
 
 func validateNodes(clientset *kubernetes.Clientset, desiredVersion string) ([]nodeVersionInfo, bool) {
@@ -309,6 +418,16 @@ func repeatChar(char string, count int) string {
 	return out
 }
 
+func statusToChar(isRunning bool, shouldBeRunning bool) string {
+	if isRunning == true {
+		return "✅"
+	} else if shouldBeRunning == true && isRunning == false {
+		return "❌"
+	} else { // isRunning and shouldBeRunning are both false or anything else, Warning (the triangle isn't as font supported)
+		return "🚫"
+	}
+}
+
 type nodeVersionInfo struct {
 	name     string
 	version  string
@@ -378,6 +497,7 @@ func main() {
 	clusterList = append(clusterList, "rnusw2-dmzsql-background-tsm-a")
 	clusterList = append(clusterList, "rnusw2-dmzsql-background-tsm-b")
 	*/
+	const outputFormatString = "%*s | %1s | %8s | %14s | %6s | %8s | %8s | %8s | %6s | %9s | %13s | %9s | %9s | %2s %2s %2s %2s \n"
 	home := homeDir()
 
 	flag.BoolVar(&debug, "d", false, "(optional) Debug")
@@ -406,12 +526,12 @@ func main() {
 		}
 	}
 
-	fmt.Printf("%*s | %10s | %24s | %8s | %8s | %10s | %10s\n", clusterNameWidth, " ", "Server", "Node", "Istio", "Nginx", "Cilium", "Varnish")
+	fmt.Printf(outputFormatString, clusterNameWidth, " ", " ", "Server", "Node", "Istio", "Nginx", "Cilium", "Karp.", "VPA", "CastAI", "Varnish", "PostProxy", "Operator", "Prom", "Ths", "NEx", "KE")
 
 	for i := 0; i < len(clusterList); i++ {
 
 		wg.Add(1)
-		go doTheThing(&wg, clusterList[i], filepath.Join(home, baseConfigDir, clusterList[i]), kubeContext, namespace, validateHelmSecrets, versionListOnly, summary, fixIt, nukeHelmSecrets, clusterNameWidth, debug)
+		go doTheThing(&wg, clusterList[i], filepath.Join(home, baseConfigDir, clusterList[i]), kubeContext, namespace, validateHelmSecrets, versionListOnly, summary, fixIt, nukeHelmSecrets, clusterNameWidth, outputFormatString, debug)
 		//clusterVersions = append(clusterVersions, currentInfo)
 
 		// fmt.Printf("%sKubernetes Server Version: %s%s%s\n", goodColor, white, currentInfo.serverVersion, normalColor)
@@ -428,7 +548,7 @@ func main() {
 	wg.Wait()
 }
 
-func doTheThing(wg *sync.WaitGroup, clusterName string, kubeConfig string, kubeContext string, namespace string, validateHelmSecrets bool, versionListOnly bool, summary bool, fixIt bool, nukeHelmSecrets bool, clusterNameWidth int, debug bool) clusterInfo {
+func doTheThing(wg *sync.WaitGroup, clusterName string, kubeConfig string, kubeContext string, namespace string, validateHelmSecrets bool, versionListOnly bool, summary bool, fixIt bool, nukeHelmSecrets bool, clusterNameWidth int, outputFormatString string, debug bool) clusterInfo {
 	defer wg.Done()
 
 	var divider string
@@ -439,6 +559,10 @@ func doTheThing(wg *sync.WaitGroup, clusterName string, kubeConfig string, kubeC
 	var upToDateNote string
 	var nodesOutOfDate int
 	var clusterData clusterInfo
+	var isLaned bool
+
+	isLaned = false
+	clusterData.clusterName = clusterName
 
 	configOverrides := &clientcmd.ConfigOverrides{}
 
@@ -465,6 +589,26 @@ func doTheThing(wg *sync.WaitGroup, clusterName string, kubeConfig string, kubeC
 	if err != nil {
 		return clusterData
 		//		panic(err.Error())
+	}
+
+	// Create a Dynamic Client to interface with CRDs.
+	dynamicClient, _ := dynamic.NewForConfig(config)
+
+	// Create a GVR which represents an Istio Virtual Service.
+	virtualServiceGVR := schema.GroupVersionResource{
+		Group:    "networking.istio.io",
+		Version:  "v1",
+		Resource: "virtualservices",
+	}
+
+	// List all of the Virtual Services.
+	virtualServices, _ := dynamicClient.Resource(virtualServiceGVR).Namespace("").List(context.TODO(), metav1.ListOptions{})
+	for _, virtualService := range virtualServices.Items {
+		//		isLaned = strings.Contains(virtualService.GetName(), "lane-decision")
+		//		fmt.Printf("%s %d\n", virtualService.GetName())
+		if !isLaned {
+			isLaned = strings.Contains(virtualService.GetName(), "lane-decision")
+		}
 	}
 
 	if kubeConfig != "" {
@@ -518,6 +662,7 @@ func doTheThing(wg *sync.WaitGroup, clusterName string, kubeConfig string, kubeC
 	}
 
 	clusterData.nodeVersion = nodeVersions[0].version
+	clusterData.nodeCount = len(nodeVersions)
 
 	clusterData.nodeUpToDateNote = "Yes"
 	if nodesOutOfDate > 0 {
@@ -527,6 +672,16 @@ func doTheThing(wg *sync.WaitGroup, clusterName string, kubeConfig string, kubeC
 	clusterData.ciliumVersion = findCiliumVersion(clientset, debug)
 	clusterData.nginxVersion = findNginxVersion(clientset, debug)
 	clusterData.varnishBuildID = findVarnishBuildID(clientset, debug)
+	clusterData.varnish = isHealthy(clientset, "app.kubernetes.io/name=varnish-enterprise", debug)
+	clusterData.prometheus = isHealthy(clientset, "app.kubernetes.io/component=prometheus", debug)
+	clusterData.thanos = isHealthy(clientset, "app.kubernetes.io/instance=thanos-query", debug)
+	clusterData.keda = isHealthy(clientset, "app.kubernetes.io/name=keda-operator", debug)
+	clusterData.nodeExplorer = isHealthy(clientset, "app.kubernetes.io/name=node-exporter", debug)
+	clusterData.postproxy = isHealthy(clientset, "app.kubernetes.io/name=postproxy", debug)
+	clusterData.karpenter = isHealthy(clientset, "app.kubernetes.io/name=karpenter", debug)
+	clusterData.castAgent = isHealthy(clientset, "app.kubernetes.io/name=castai-agent", debug)
+	clusterData.verticalPodAutoscaler = isHealthy(clientset, "app.kubernetes.io/name=vertical-pod-autoscaler", debug)
+	clusterData.costarSyncOperator = isHealthy(clientset, "app.kubernetes.io/instance=sync-operator", debug)
 
 	requiredIstioVersion = findIstioVersion(clientset, debug)
 	clusterData.istioVersion = requiredIstioVersion
@@ -707,8 +862,32 @@ func doTheThing(wg *sync.WaitGroup, clusterName string, kubeConfig string, kubeC
 		}
 	}
 	fmt.Printf("%s", normalColor)
+	var isLanedChar string
+	isLanedChar = "U"
+	if isLaned {
+		isLanedChar = "L" //"\u21CC"
+	}
 
-	fmt.Printf("%*s | %10s | %24s | %8s | %8s | %10s | %10s \n", clusterNameWidth, clusterName, clusterData.serverVersion, clusterData.nodeVersion, clusterData.istioVersion, clusterData.nginxVersion, clusterData.ciliumVersion, clusterData.varnishBuildID)
+	//	fmt.Printf("%*s | %1s | %8s | %8s | %6s | %8s | %8s | %8s | %6s | %9s | %8s x %2d | %9s |%3s %3s %3s %3s\n",
+	fmt.Printf(outputFormatString,
+		clusterNameWidth,
+		clusterName,
+		isLanedChar,
+		clusterData.serverVersion,
+		fmt.Sprintf("%8s x %3d", nodeVersionClean(clusterData.nodeVersion), clusterData.nodeCount),
+		clusterData.istioVersion,
+		clusterData.nginxVersion,
+		clusterData.ciliumVersion,
+		clusterData.karpenter.version,
+		clusterData.verticalPodAutoscaler.version,
+		clusterData.castAgent.version,
+		fmt.Sprintf("%8s x %2d", clusterData.varnishBuildID, clusterData.varnish.replicas),
+		clusterData.postproxy.version,
+		hashSubStr(clusterData.costarSyncOperator.version, 8),
+		statusToChar(clusterData.prometheus.isHealthy, true),
+		statusToChar(clusterData.thanos.isHealthy, clusterData.thanos.isInstalled),
+		statusToChar(clusterData.nodeExplorer.isHealthy, true),
+		statusToChar(clusterData.keda.isHealthy, clusterData.keda.isInstalled))
 
 	return clusterData
 }
@@ -720,6 +899,13 @@ func (o ownerInfoList) containsName(n string) bool {
 		}
 	}
 	return false
+}
+
+func hashSubStr(x string, l int) string {
+	if l > len(x) {
+		return x[0:]
+	}
+	return x[0:l]
 }
 
 // func (e podsToRestartList) Len() int {
