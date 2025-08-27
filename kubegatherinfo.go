@@ -245,7 +245,6 @@ func findVarnishBuildID(clientset *kubernetes.Clientset, display bool) string {
 		requiredVarnishVersion = "0"
 	} else { // XXX Need to check ALL pods here
 		_, _, requiredVarnishVersion = breakoutImage(varnishPodList.Items[0].Spec.Containers[0].Image)
-		fmt.Printf("%s\n", varnishPodList.Items[0].Spec.Containers[0].Image)
 		allMatching = true
 		for i := 0; i < len(varnishPodList.Items)-1; i++ {
 			_, _, varnishVersion := breakoutImage(varnishPodList.Items[i].Spec.Containers[0].Image)
