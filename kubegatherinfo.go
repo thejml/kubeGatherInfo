@@ -113,6 +113,7 @@ type clusterInfo struct {
 	verticalPodAutoscaler serviceHealthInfo
 	castAgent             serviceHealthInfo
 	costarSyncOperator    serviceHealthInfo
+	isOnline              bool
 }
 
 type serviceHealthInfo struct {
@@ -139,10 +140,11 @@ func nodeVersionClean(ver string) string {
 }
 
 func breakoutImage(image string) (string, string, string) {
+	imageSanitized := strings.Split(image, "@")[0]
 	r, _ := regexp.Compile("^([0-9a-zA-Z.-]+)/([-0-9a-zA-Z./]+):([-0-9a-zA-Z.]+)$")
 
-	var matches [3]string
-	for index, match := range r.FindStringSubmatch(image) {
+	var matches [4]string
+	for index, match := range r.FindStringSubmatch(imageSanitized) {
 		if index > 0 {
 			matches[index-1] = match
 		}
@@ -243,6 +245,7 @@ func findVarnishBuildID(clientset *kubernetes.Clientset, display bool) string {
 		requiredVarnishVersion = "0"
 	} else { // XXX Need to check ALL pods here
 		_, _, requiredVarnishVersion = breakoutImage(varnishPodList.Items[0].Spec.Containers[0].Image)
+		fmt.Printf("%s\n", varnishPodList.Items[0].Spec.Containers[0].Image)
 		allMatching = true
 		for i := 0; i < len(varnishPodList.Items)-1; i++ {
 			_, _, varnishVersion := breakoutImage(varnishPodList.Items[i].Spec.Containers[0].Image)
@@ -563,6 +566,7 @@ func doTheThing(wg *sync.WaitGroup, clusterName string, kubeConfig string, kubeC
 
 	isLaned = false
 	clusterData.clusterName = clusterName
+	clusterData.isOnline = false
 
 	configOverrides := &clientcmd.ConfigOverrides{}
 
@@ -610,6 +614,9 @@ func doTheThing(wg *sync.WaitGroup, clusterName string, kubeConfig string, kubeC
 			isLaned = strings.Contains(virtualService.GetName(), "lane-decision")
 		}
 	}
+
+	// If we made it here, we got the connections we need:
+	clusterData.isOnline = true
 
 	if kubeConfig != "" {
 		if kubeContext != "" {
