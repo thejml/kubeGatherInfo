@@ -103,6 +103,7 @@ type clusterInfo struct {
 	istioVersion          string
 	nginxVersion          string
 	varnishBuildID        string
+	ingressVersion        string
 	varnish               serviceHealthInfo
 	prometheus            serviceHealthInfo
 	thanos                serviceHealthInfo
@@ -274,6 +275,26 @@ func findVarnishBuildID(clientset *kubernetes.Clientset, display bool) string {
 
 func isPhaseHealthy(phase string) bool {
 	return (phase == "Running")
+}
+
+func checkLabel(clientset *kubernetes.Clientset, labelMatch string, labelCheck string, display bool) string {
+	var outputString string
+	outputString = ""
+
+	podList, _ := clientset.CoreV1().Pods("").List(context.TODO(), metav1.ListOptions{LabelSelector: labelMatch})
+
+	if len(podList.Items) != 0 {
+		labels := podList.Items[0].GetLabels()
+		outputString = labels[labelCheck]
+		// for k, v := range labels {
+		// 	fmt.Printf("\t\t%s => %s", k, v)
+		// }
+
+		if display {
+			fmt.Printf("%s => %s", labelCheck, outputString)
+		}
+	}
+	return outputString
 }
 
 // app.kubernetes.io/component=prometheus
@@ -499,7 +520,7 @@ func main() {
 	clusterList = append(clusterList, "rnusw2-dmzsql-background-tsm-a")
 	clusterList = append(clusterList, "rnusw2-dmzsql-background-tsm-b")
 	*/
-	const outputFormatString = "%*s | %1s | %8s | %14s | %6s | %8s | %8s | %8s | %6s | %9s | %13s | %9s | %9s | %2s %2s %2s %2s \n"
+	const outputFormatString = "%*s | %1s | %8s | %14s | %6s | %18s | %8s | %8s | %6s | %9s | %13s | %9s | %9s | %2s %2s %2s %2s \n"
 	home := homeDir()
 
 	flag.BoolVar(&debug, "d", false, "(optional) Debug")
@@ -605,7 +626,11 @@ func doTheThing(wg *sync.WaitGroup, clusterName string, kubeConfig string, kubeC
 	}
 
 	// List all of the Virtual Services.
-	virtualServices, _ := dynamicClient.Resource(virtualServiceGVR).Namespace("").List(context.TODO(), metav1.ListOptions{})
+	virtualServices, err := dynamicClient.Resource(virtualServiceGVR).Namespace("").List(context.TODO(), metav1.ListOptions{})
+	if err != nil {
+		return clusterData
+	}
+
 	for _, virtualService := range virtualServices.Items {
 		//		isLaned = strings.Contains(virtualService.GetName(), "lane-decision")
 		//		fmt.Printf("%s %d\n", virtualService.GetName())
@@ -688,6 +713,10 @@ func doTheThing(wg *sync.WaitGroup, clusterName string, kubeConfig string, kubeC
 	clusterData.castAgent = isHealthy(clientset, "app.kubernetes.io/name=castai-agent", debug)
 	clusterData.verticalPodAutoscaler = isHealthy(clientset, "app.kubernetes.io/name=vertical-pod-autoscaler", debug)
 	clusterData.costarSyncOperator = isHealthy(clientset, "app.kubernetes.io/instance=sync-operator", debug)
+	// get version of ingress chart run:
+	ingressVersionString := checkLabel(clientset, "app.kubernetes.io/name=ingress-nginx", "helm.sh/chart", false)
+	ingressVersionArray := strings.Split(ingressVersionString, "-")
+	clusterData.ingressVersion = ingressVersionArray[2]
 
 	requiredIstioVersion = findIstioVersion(clientset, debug)
 	clusterData.istioVersion = requiredIstioVersion
@@ -882,7 +911,7 @@ func doTheThing(wg *sync.WaitGroup, clusterName string, kubeConfig string, kubeC
 		clusterData.serverVersion,
 		fmt.Sprintf("%8s x %3d", nodeVersionClean(clusterData.nodeVersion), clusterData.nodeCount),
 		clusterData.istioVersion,
-		clusterData.nginxVersion,
+		fmt.Sprintf("%s @ %s", clusterData.nginxVersion, clusterData.ingressVersion),
 		clusterData.ciliumVersion,
 		clusterData.karpenter.version,
 		clusterData.verticalPodAutoscaler.version,
